@@ -134,8 +134,8 @@ public class KillAuraPlus extends Module {
         if (debug.get() && ++debugTicks >= 5) {
             debugTicks = 0;
             info(String.format(
-                "цель=%s дист=%.1f падение=%.2f земля=%s спринт=%s кд=%.2f крит=%s",
-                target.getType().getUntranslatedName(), best, mc.player.fallDistance,
+                "цель=%s дист=%.1f падение=%.2f vy=%.2f земля=%s спринт=%s кд=%.2f крит=%s",
+                target.getType().getUntranslatedName(), best, mc.player.fallDistance, mc.player.getVelocity().y,
                 mc.player.isOnGround(), mc.player.isSprinting(),
                 mc.player.getAttackCooldownProgress(0.5f), canCrit()
             ));
@@ -159,7 +159,7 @@ public class KillAuraPlus extends Module {
     // Условия ванильного крита: падение, не на земле, не в воде, не на лестнице,
     // нет слепоты, не на транспорте и не в спринте.
     private boolean canCrit() {
-        return mc.player.fallDistance > 0
+        return (mc.player.fallDistance > 0 || mc.player.getVelocity().y < -0.1)
             && !mc.player.isOnGround()
             && !mc.player.isClimbing()
             && !mc.player.isTouchingWater()
