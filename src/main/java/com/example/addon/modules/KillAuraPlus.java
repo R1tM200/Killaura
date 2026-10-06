@@ -54,6 +54,15 @@ public class KillAuraPlus extends Module {
         .build()
     );
 
+    private final Setting<Boolean> debug = sgGeneral.add(new BoolSetting.Builder()
+        .name("debug")
+        .description("Писать в чат состояние игрока, когда цель в радиусе.")
+        .defaultValue(false)
+        .build()
+    );
+
+    private int debugTicks = 0;
+
     private final Setting<Boolean> onlyCrits = sgCrits.add(new BoolSetting.Builder()
         .name("only-crits")
         .description("Бить только в падении, чтобы удар был критическим.")
@@ -104,7 +113,6 @@ public class KillAuraPlus extends Module {
         if (mc.player == null || mc.world == null) return;
         if (!mc.player.isAlive()) return;
         if (pauseOnUse.get() && mc.player.isUsingItem()) return;
-        if (mc.player.getAttackCooldownProgress(0.5f) < 1f) return;
 
         Entity target = null;
         double best = Double.MAX_VALUE;
@@ -122,6 +130,18 @@ public class KillAuraPlus extends Module {
         }
 
         if (target == null) return;
+
+        if (debug.get() && ++debugTicks >= 5) {
+            debugTicks = 0;
+            info(String.format(
+                "цель=%s дист=%.1f падение=%.2f земля=%s спринт=%s кд=%.2f крит=%s",
+                target.getType().getUntranslatedName(), best, mc.player.fallDistance,
+                mc.player.isOnGround(), mc.player.isSprinting(),
+                mc.player.getAttackCooldownProgress(0.5f), canCrit()
+            ));
+        }
+
+        if (mc.player.getAttackCooldownProgress(0.5f) < 1f) return;
 
         if (onlyCrits.get() && !canCrit()) {
             boolean tooClose = critFallback.get() && best <= fallbackDistance.get();
