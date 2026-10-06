@@ -40,6 +40,7 @@ import net.minecraft.registry.Registries;
 import net.minecraft.util.Hand;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.GameMode;
 
 import java.util.ArrayList;
@@ -161,6 +162,23 @@ public class KillAuraPlus extends Module {
         .defaultValue(3.5)
         .min(0)
         .sliderMax(6)
+        .build()
+    );
+
+    private final Setting<Integer> fov = sgTargeting.add(new IntSetting.Builder()
+        .name("fov")
+        .description("Угол обзора, в котором бьём цели (360 = вокруг, 90 = только то, что перед тобой).")
+        .defaultValue(360)
+        .min(1)
+        .sliderRange(30, 360)
+        .max(360)
+        .build()
+    );
+
+    private final Setting<Boolean> ignoreFriends = sgTargeting.add(new BoolSetting.Builder()
+        .name("ignore-friends")
+        .description("Не бить друзей из списка друзей Meteor.")
+        .defaultValue(true)
         .build()
     );
 
@@ -464,6 +482,7 @@ public class KillAuraPlus extends Module {
             MathHelper.clamp(mc.player.getZ(), hitbox.minZ, hitbox.maxZ),
             range.get())) return false;
 
+        if (!inFov(entity)) return false;
         if (!entities.get().contains(entity.getType())) return false;
         if (ignoreNamed.get() && entity.hasCustomName()) return false;
         if (!PlayerUtils.canSeeEntity(entity) && !PlayerUtils.isWithin(entity, wallsRange.get())) return false;
@@ -482,7 +501,7 @@ public class KillAuraPlus extends Module {
 
         if (entity instanceof PlayerEntity player) {
             if (player.isCreative()) return false;
-            if (!Friends.get().shouldAttack(player)) return false;
+            if (ignoreFriends.get() && !Friends.get().shouldAttack(player)) return false;
             if (shieldMode.get() == ShieldMode.Ignore
                 && player.blockedByShield(mc.world.getDamageSources().playerAttack(mc.player))) return false;
         }
@@ -496,6 +515,16 @@ public class KillAuraPlus extends Module {
         }
 
         return true;
+    }
+
+    private boolean inFov(Entity entity) {
+        if (fov.get() >= 360) return true;
+
+        Vec3d look = mc.player.getRotationVec(1f);
+        Vec3d toTarget = entity.getBoundingBox().getCenter().subtract(mc.player.getEyePos()).normalize();
+        double angle = Math.toDegrees(Math.acos(MathHelper.clamp(look.dotProduct(toTarget), -1.0, 1.0)));
+
+        return angle <= fov.get() / 2.0;
     }
 
     private boolean delayCheck() {
