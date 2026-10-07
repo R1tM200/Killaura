@@ -76,6 +76,20 @@ public class KillAuraPlus extends Module {
         .build()
     );
 
+    private final Setting<Boolean> silentAim = sgGeneral.add(new BoolSetting.Builder()
+        .name("silent-aim")
+        .description("Серверный аим: поворот отправляется на сервер ровно в момент удара, камера у тебя не двигается. Не работает при rotate = None.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Target> aimPoint = sgGeneral.add(new EnumSetting.Builder<Target>()
+        .name("aim-point")
+        .description("Куда целиться на цели: голова, тело или ноги.")
+        .defaultValue(Target.Body)
+        .build()
+    );
+
     private final Setting<Boolean> autoSwitch = sgGeneral.add(new BoolSetting.Builder()
         .name("auto-switch")
         .description("Switches to your selected weapon when attacking the target.")
@@ -283,6 +297,16 @@ public class KillAuraPlus extends Module {
         .build()
     );
 
+    private final Setting<Integer> fallDelay = sgCrits.add(new IntSetting.Builder()
+        .name("fall-delay")
+        .description("Сколько тиков ждать после начала падения перед ударом (1 тик = 0.05 с).")
+        .defaultValue(0)
+        .min(0)
+        .sliderMax(10)
+        .visible(onlyCrits::get)
+        .build()
+    );
+
     private final Setting<Boolean> critFallback = sgCrits.add(new BoolSetting.Builder()
         .name("close-fallback")
         .description("Если цель очень близко (почти вплотную), бить без крита.")
@@ -310,7 +334,7 @@ public class KillAuraPlus extends Module {
 
     private final List<Entity> targets = new ArrayList<>();
     private int previousSlot = -1;
-    private int hitTimer, switchTimer, debugTicks;
+    private int hitTimer, switchTimer, debugTicks, fallingTicks;
     private boolean wasPathing = false;
     private boolean swapped = false;
     private boolean attacking = false;
@@ -341,6 +365,9 @@ public class KillAuraPlus extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
+        if (!mc.player.isOnGround() && mc.player.getVelocity().y < 0) fallingTicks++;
+        else fallingTicks = 0;
+
         if (!mc.player.isAlive() || PlayerUtils.getGameMode() == GameMode.SPECTATOR) {
             stopAttacking();
             return;
@@ -415,8 +442,8 @@ public class KillAuraPlus extends Module {
         }
 
         attacking = true;
-        if (rotation.get() == RotationMode.Always) {
-            Rotations.rotate(Rotations.getYaw(primary), Rotations.getPitch(primary, Target.Body));
+        if (rotation.get() == RotationMode.Always && !silentAim.get()) {
+            Rotations.rotate(Rotations.getYaw(primary), Rotations.getPitch(primary, aimPoint.get()));
         }
 
         if (pauseOnCombat.get() && PathManagers.get().isPathing() && !wasPathing) {
@@ -427,11 +454,11 @@ public class KillAuraPlus extends Module {
         if (debug.get() && ++debugTicks >= 5) {
             debugTicks = 0;
             info(String.format(
-                "цель=%s дист=%.1f падение=%.2f vy=%.2f земля=%s спринт=%s кд=%.2f крит=%s",
+                "цель=%s дист=%.1f падение=%.2f vy=%.2f земля=%s спринт=%s кд=%.2f крит=%s тиков_падения=%d",
                 primary.getType().getUntranslatedName(), (double) mc.player.distanceTo(primary),
                 mc.player.fallDistance, mc.player.getVelocity().y,
                 mc.player.isOnGround(), mc.player.isSprinting(),
-                mc.player.getAttackCooldownProgress(0.5f), canCrit()
+                mc.player.getAttackCooldownProgress(0.5f), canCrit(), fallingTicks
             ));
         }
 
@@ -521,10 +548,20 @@ public class KillAuraPlus extends Module {
         if (fov.get() >= 360) return true;
 
         Vec3d look = mc.player.getRotationVec(1f);
-        Vec3d toTarget = entity.getBoundingBox().getCenter().subtract(mc.player.getEyePos()).normalize();
-        double angle = Math.toDegrees(Math.acos(MathHelper.clamp(look.dotProduct(toTarget), -1.0, 1.0)));
+        Vec3d eye = mc.player.getEyePos();
+        Box box = entity.getBoundingBox();
+        Vec3d center = box.getCenter();
 
-        return angle <= fov.get() / 2.0;
+        // Берём самый маленький угол до ног, центра и головы цели,
+        // чтобы цель не выпадала из FOV, когда смотришь ей в голову
+        double best = 180;
+        for (double y : new double[]{box.minY, center.y, box.maxY}) {
+            Vec3d to = new Vec3d(center.x, y, center.z).subtract(eye).normalize();
+            double angle = Math.toDegrees(Math.acos(MathHelper.clamp(look.dotProduct(to), -1.0, 1.0)));
+            best = Math.min(best, angle);
+        }
+
+        return best <= fov.get() / 2.0;
     }
 
     private boolean delayCheck() {
@@ -562,15 +599,23 @@ public class KillAuraPlus extends Module {
 
     private boolean critReady(Entity primary) {
         if (!onlyCrits.get()) return true;
-        if (canCrit()) return true;
+        if (canCrit() && fallingTicks >= fallDelay.get()) return true;
         return critFallback.get() && mc.player.distanceTo(primary) <= fallbackDistance.get();
     }
 
     private void attack(Entity target) {
-        if (rotation.get() == RotationMode.OnHit) {
-            Rotations.rotate(Rotations.getYaw(target), Rotations.getPitch(target, Target.Body));
+        if (silentAim.get() && rotation.get() != RotationMode.None) {
+            // Поворот уходит на сервер и удар происходит в тот же момент, камера не двигается
+            Rotations.rotate(Rotations.getYaw(target), Rotations.getPitch(target, aimPoint.get()), () -> hit(target));
+        } else {
+            if (rotation.get() == RotationMode.OnHit) {
+                Rotations.rotate(Rotations.getYaw(target), Rotations.getPitch(target, aimPoint.get()));
+            }
+            hit(target);
         }
+    }
 
+    private void hit(Entity target) {
         boolean unsprint = onlyCrits.get() && stopSprint.get() && mc.player.isSprinting() && canCrit();
         if (unsprint) {
             mc.player.networkHandler.sendPacket(new ClientCommandC2SPacket(mc.player, ClientCommandC2SPacket.Mode.STOP_SPRINTING));
