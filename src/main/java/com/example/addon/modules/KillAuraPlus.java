@@ -1,6 +1,8 @@
 package com.example.addon.modules;
 
 import com.example.addon.AddonTemplate;
+import meteordevelopment.meteorclient.events.entity.player.PlayerTickMovementEvent;
+import meteordevelopment.meteorclient.events.entity.player.SendMovementPacketsEvent;
 import meteordevelopment.meteorclient.events.packets.PacketEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.pathing.PathManagers;
@@ -80,8 +82,16 @@ public class KillAuraPlus extends Module {
 
     private final Setting<Boolean> silentAim = sgGeneral.add(new BoolSetting.Builder()
         .name("silent-aim")
-        .description("Бить уже после того, как на сервер ушёл поворот к цели (техника Baritone). Камера у тебя не двигается. Не работает при rotate = None.")
+        .description("Техника Baritone: на время тика подменяется угол игрока, на сервер уходит поворот к цели, а камера у тебя остаётся на месте. Удар идёт уже после пакета с поворотом. Не работает при rotate = None.")
         .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Boolean> moveFix = sgGeneral.add(new BoolSetting.Builder()
+        .name("move-fix")
+        .description("Подгонять ходьбу под серверный поворот, чтобы античит не откатывал назад (направление ходьбы округляется до 45 градусов). Работает вместе с silent-aim.")
+        .defaultValue(true)
+        .visible(silentAim::get)
         .build()
     );
 
@@ -359,6 +369,10 @@ public class KillAuraPlus extends Module {
     );
 
     private final List<Entity> targets = new ArrayList<>();
+    private boolean spoofPlanned, spoofApplied, hitPending, keysSaved;
+    private float planYaw, planPitch, realYaw, realPitch;
+    private final boolean[] savedKeys = new boolean[4];
+    private final List<Entity> hitTargets = new ArrayList<>();
     private int previousSlot = -1;
     private int trackedSlot = -1;
     private int slotBeforeForce = -1;
@@ -390,6 +404,7 @@ public class KillAuraPlus extends Module {
 
     @Override
     public void onDeactivate() {
+        endSpoof();
         targets.clear();
         stopAttacking();
     }
@@ -496,12 +511,112 @@ public class KillAuraPlus extends Module {
             ));
         }
 
-        if (reachDistance(primary) <= hitReach.get() && delayCheck() && critReady(primary)) {
-            attackAll(primary);
+        boolean hitNow = reachDistance(primary) <= hitReach.get() && delayCheck() && critReady(primary);
+        boolean silent = silentAim.get() && rotation.get() != RotationMode.None;
+
+        if (silent) {
+            // Always: смотрим на цель на сервере каждый тик. OnHit: только в тик удара.
+            if (hitNow || rotation.get() == RotationMode.Always) planSpoof(primary, hitNow);
+        } else if (hitNow) {
+            attackAll();
         } else if (rotation.get() == RotationMode.Always) {
-            // Серверный взгляд на цель каждый тик (экран не двигается)
             Rotations.rotate(aimYaw(primary), aimPitch(primary));
         }
+    }
+
+    // ---------- Серверный поворот в стиле Baritone ----------
+
+    private void planSpoof(Entity primary, boolean hit) {
+        spoofPlanned = true;
+        spoofApplied = false;
+        hitPending = hit;
+
+        planYaw = (float) aimYaw(primary);
+        planPitch = (float) aimPitch(primary);
+        realYaw = mc.player.getYaw();
+        realPitch = mc.player.getPitch();
+
+        hitTargets.clear();
+        hitTargets.addAll(targets);
+
+        if (moveFix.get()) applyMoveFix();
+    }
+
+    // Переписываем нажатые клавиши ходьбы так, чтобы при серверном угле игрок шёл
+    // примерно туда же, куда он идёт по своей камере (с точностью до 45 градусов).
+    private void applyMoveFix() {
+        boolean fw = mc.options.forwardKey.isPressed();
+        boolean bk = mc.options.backKey.isPressed();
+        boolean lf = mc.options.leftKey.isPressed();
+        boolean rt = mc.options.rightKey.isPressed();
+
+        int f = (fw ? 1 : 0) - (bk ? 1 : 0);
+        int sd = (lf ? 1 : 0) - (rt ? 1 : 0);
+        if (f == 0 && sd == 0) return;
+
+        savedKeys[0] = fw;
+        savedKeys[1] = bk;
+        savedKeys[2] = lf;
+        savedKeys[3] = rt;
+        keysSaved = true;
+
+        double phi = Math.toDegrees(Math.atan2(sd, f)) + (planYaw - realYaw);
+        int idx = Math.floorMod((int) Math.round(phi / 45.0), 8);
+        int[][] dirs = {{1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}, {0, -1}, {1, -1}};
+
+        mc.options.forwardKey.setPressed(dirs[idx][0] > 0);
+        mc.options.backKey.setPressed(dirs[idx][0] < 0);
+        mc.options.leftKey.setPressed(dirs[idx][1] > 0);
+        mc.options.rightKey.setPressed(dirs[idx][1] < 0);
+    }
+
+    private void applySpoof() {
+        if (!spoofPlanned || spoofApplied || mc.player == null) return;
+        spoofApplied = true;
+        mc.player.setYaw(planYaw);
+        mc.player.setPitch(planPitch);
+    }
+
+    private void endSpoof() {
+        if (spoofApplied && mc.player != null) {
+            mc.player.setYaw(realYaw);
+            mc.player.setPitch(realPitch);
+        }
+        if (keysSaved) {
+            mc.options.forwardKey.setPressed(savedKeys[0]);
+            mc.options.backKey.setPressed(savedKeys[1]);
+            mc.options.leftKey.setPressed(savedKeys[2]);
+            mc.options.rightKey.setPressed(savedKeys[3]);
+            keysSaved = false;
+        }
+        spoofPlanned = false;
+        spoofApplied = false;
+        hitPending = false;
+    }
+
+    @EventHandler
+    private void onPlayerTickMovement(PlayerTickMovementEvent event) {
+        applySpoof();
+    }
+
+    @EventHandler
+    private void onMovementPacketsPre(SendMovementPacketsEvent.Pre event) {
+        applySpoof();
+    }
+
+    // Пакет с поворотом уже ушёл на сервер, теперь бьём
+    @EventHandler
+    private void onMovementPacketsPost(SendMovementPacketsEvent.Post event) {
+        if (!spoofApplied || !hitPending) return;
+        hitPending = false;
+        for (Entity target : hitTargets) {
+            if (target.isAlive() && reachDistance(target) <= hitReach.get()) hit(target);
+        }
+    }
+
+    @EventHandler
+    private void onTickPost(TickEvent.Post event) {
+        endSpoof();
     }
 
     // Сервер сам сменил слот: запоминаем слот, который выбрал игрок до этого
@@ -741,23 +856,13 @@ public class KillAuraPlus extends Module {
         return critFallback.get() && mc.player.distanceTo(primary) <= fallbackDistance.get();
     }
 
-    private void attackAll(Entity primary) {
-        if (silentAim.get() && rotation.get() != RotationMode.None) {
-            // Как в Baritone: на время тика подменяем угол, пакет движения уходит с нужным
-            // поворотом, и только после него бьём. Камера у тебя при этом не двигается.
-            final List<Entity> snapshot = new ArrayList<>(targets);
-            Rotations.rotate(aimYaw(primary), aimPitch(primary), () -> {
-                for (Entity target : snapshot) {
-                    if (reachDistance(target) <= hitReach.get()) hit(target);
-                }
-            });
-        } else {
-            for (Entity target : targets) {
-                if (rotation.get() == RotationMode.OnHit) {
-                    Rotations.rotate(aimYaw(target), aimPitch(target));
-                }
-                if (reachDistance(target) <= hitReach.get()) hit(target);
+    // Обычный режим (как в Meteor): поворот через Rotations и удар сразу
+    private void attackAll() {
+        for (Entity target : targets) {
+            if (rotation.get() == RotationMode.OnHit) {
+                Rotations.rotate(aimYaw(target), aimPitch(target));
             }
+            if (reachDistance(target) <= hitReach.get()) hit(target);
         }
     }
 
