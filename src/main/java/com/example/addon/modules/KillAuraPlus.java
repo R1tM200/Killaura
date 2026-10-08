@@ -369,7 +369,8 @@ public class KillAuraPlus extends Module {
     );
 
     private final List<Entity> targets = new ArrayList<>();
-    private boolean spoofPlanned, spoofApplied, hitPending, keysSaved;
+    private boolean spoofPlanned, spoofApplied, hitPending, keysSaved, prevSpoofed;
+    private int planTargetId = -1, prevSpoofTarget = -1;
     private float planYaw, planPitch, realYaw, realPitch;
     private final boolean[] savedKeys = new boolean[4];
     private final List<Entity> hitTargets = new ArrayList<>();
@@ -515,8 +516,23 @@ public class KillAuraPlus extends Module {
         boolean silent = silentAim.get() && rotation.get() != RotationMode.None;
 
         if (silent) {
-            // Always: смотрим на цель на сервере каждый тик. OnHit: только в тик удара.
-            if (hitNow || rotation.get() == RotationMode.Always) planSpoof(primary, hitNow);
+            boolean always = rotation.get() == RotationMode.Always;
+            boolean aimed = prevSpoofed && prevSpoofTarget == primary.getId();
+
+            if (always && hitNow && aimed) {
+                // Как у обычного клиента: поворот на цель ушёл на сервер в прошлом тике,
+                // а удар идёт в начале этого тика, ДО пакета движения.
+                for (Entity target : targets) {
+                    if (reachDistance(target) <= hitReach.get()) hit(target);
+                }
+                planSpoof(primary, false);
+            } else if (always) {
+                // Сначала навёлся, бьём со следующего тика
+                planSpoof(primary, false);
+            } else if (hitNow) {
+                // OnHit: поворот и сразу удар после пакета с поворотом
+                planSpoof(primary, true);
+            }
         } else if (hitNow) {
             attackAll();
         } else if (rotation.get() == RotationMode.Always) {
@@ -531,6 +547,7 @@ public class KillAuraPlus extends Module {
         spoofApplied = false;
         hitPending = hit;
 
+        planTargetId = primary.getId();
         planYaw = (float) aimYaw(primary);
         planPitch = (float) aimPitch(primary);
         realYaw = mc.player.getYaw();
@@ -589,6 +606,8 @@ public class KillAuraPlus extends Module {
             mc.options.rightKey.setPressed(savedKeys[3]);
             keysSaved = false;
         }
+        prevSpoofed = spoofApplied;
+        prevSpoofTarget = planTargetId;
         spoofPlanned = false;
         spoofApplied = false;
         hitPending = false;
