@@ -36,8 +36,8 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.item.MaceItem;
 import net.minecraft.item.SwordItem;
 import net.minecraft.item.TridentItem;
-import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
 import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
+import net.minecraft.network.packet.s2c.play.PlayerPositionLookS2CPacket;
 import net.minecraft.network.packet.s2c.play.UpdateSelectedSlotS2CPacket;
 import net.minecraft.registry.Registries;
 import net.minecraft.util.Hand;
@@ -160,6 +160,15 @@ public class KillAuraPlus extends Module {
         .name("restore-slot")
         .description("Если сервер сам сменил тебе слот хотбара (например, зачарование Confusion), вернуть слот, который выбрал ты. Смена колесиком или цифрой не затрагивается.")
         .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Integer> setbackPause = sgGeneral.add(new IntSetting.Builder()
+        .name("setback-pause")
+        .description("Если сервер откатил тебя назад (телепорт на место), модуль замирает на столько секунд, чтобы не копить нарушения. 0 = выключено.")
+        .defaultValue(10)
+        .min(0)
+        .sliderMax(30)
         .build()
     );
 
@@ -329,7 +338,7 @@ public class KillAuraPlus extends Module {
 
     private final Setting<Boolean> stopSprint = sgCrits.add(new BoolSetting.Builder()
         .name("stop-sprint")
-        .description("Перед критом на миг отключать спринт (в спринте крита не бывает).")
+        .description("Если ты в спринте и падаешь, снять спринт и ударить на следующем тике (в спринте крита не бывает). Без фальшивых пакетов: сервер получает обычную остановку спринта. Не работает, если включён модуль Sprint.")
         .defaultValue(true)
         .visible(onlyCrits::get)
         .build()
@@ -384,6 +393,7 @@ public class KillAuraPlus extends Module {
     private float planYaw, planPitch, realYaw, realPitch;
     private final boolean[] savedKeys = new boolean[4];
     private final List<Entity> hitTargets = new ArrayList<>();
+    private int pauseTicks = 0;
     private int previousSlot = -1;
     private int trackedSlot = -1;
     private int slotBeforeForce = -1;
@@ -410,6 +420,7 @@ public class KillAuraPlus extends Module {
         previousSlot = -1;
         swapped = false;
         forcedSlotChange = false;
+        pauseTicks = 0;
         trackedSlot = mc.player != null ? mc.player.getInventory().selectedSlot : -1;
     }
 
@@ -423,6 +434,13 @@ public class KillAuraPlus extends Module {
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         trackSelectedSlot();
+
+        if (pauseTicks > 0) {
+            pauseTicks--;
+            targets.clear();
+            stopAttacking();
+            return;
+        }
 
         if (!mc.player.isOnGround() && mc.player.getVelocity().y < 0) fallingTicks++;
         else fallingTicks = 0;
@@ -522,7 +540,18 @@ public class KillAuraPlus extends Module {
             ));
         }
 
-        boolean hitNow = reachDistance(primary) <= hitReach.get() && delayCheck() && critReady(primary);
+        // Спринт снимаем обычным способом за тик до удара: сервер получит нормальный
+        // пакет остановки, а в воздухе клиент сам спринт не включит обратно
+        boolean justUnsprinted = false;
+        if (onlyCrits.get() && stopSprint.get() && mc.player.isSprinting() && canCritIgnoreSprint()
+            && fallingTicks >= fallDelay.get()
+            && mc.player.getAttackCooldownProgress(0.5f) >= 1f
+            && reachDistance(primary) <= hitReach.get()) {
+            mc.player.setSprinting(false);
+            justUnsprinted = true;
+        }
+
+        boolean hitNow = !justUnsprinted && reachDistance(primary) <= hitReach.get() && delayCheck() && critReady(primary);
         boolean silent = silentAim.get() && rotation.get() != RotationMode.None;
 
         if (silent) {
@@ -654,6 +683,9 @@ public class KillAuraPlus extends Module {
         if (event.packet instanceof UpdateSelectedSlotS2CPacket) {
             if (!forcedSlotChange) slotBeforeForce = trackedSlot;
             forcedSlotChange = true;
+        }
+        if (event.packet instanceof PlayerPositionLookS2CPacket) {
+            pauseTicks = setbackPause.get() * 20;
         }
     }
 
@@ -870,16 +902,19 @@ public class KillAuraPlus extends Module {
         }
     }
 
-    // Условия ванильного крита: падение, не на земле, не в воде, не на лестнице,
-    // нет слепоты, не на транспорте и не в спринте (спринт мы снимаем сами).
-    private boolean canCrit() {
+    // Условия ванильного крита (без проверки спринта): падение, не на земле, не в воде,
+    // не на лестнице, нет слепоты, не на транспорте.
+    private boolean canCritIgnoreSprint() {
         return (mc.player.fallDistance > 0 || mc.player.getVelocity().y < -0.1)
             && !mc.player.isOnGround()
             && !mc.player.isClimbing()
             && !mc.player.isTouchingWater()
             && !mc.player.hasStatusEffect(StatusEffects.BLINDNESS)
-            && !mc.player.hasVehicle()
-            && (stopSprint.get() || !mc.player.isSprinting());
+            && !mc.player.hasVehicle();
+    }
+
+    private boolean canCrit() {
+        return canCritIgnoreSprint() && !mc.player.isSprinting();
     }
 
     private boolean critReady(Entity primary) {
@@ -900,18 +935,8 @@ public class KillAuraPlus extends Module {
     }
 
     private void hit(Entity target) {
-        boolean unsprint = onlyCrits.get() && stopSprint.get() && mc.player.isSprinting() && canCrit();
-        if (unsprint) {
-            mc.player.networkHandler.sendPacket(new ClientCommandC2SPacket(mc.player, ClientCommandC2SPacket.Mode.STOP_SPRINTING));
-        }
-
         mc.interactionManager.attackEntity(mc.player, target);
         mc.player.swingHand(Hand.MAIN_HAND);
-
-        if (unsprint) {
-            mc.player.networkHandler.sendPacket(new ClientCommandC2SPacket(mc.player, ClientCommandC2SPacket.Mode.START_SPRINTING));
-        }
-
         hitTimer = 0;
     }
 
