@@ -36,6 +36,7 @@ import net.minecraft.item.SwordItem;
 import net.minecraft.item.TridentItem;
 import net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket;
 import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
+import net.minecraft.network.packet.s2c.play.UpdateSelectedSlotS2CPacket;
 import net.minecraft.registry.Registries;
 import net.minecraft.util.Hand;
 import net.minecraft.util.math.Box;
@@ -54,6 +55,7 @@ public class KillAuraPlus extends Module {
     public enum RotationMode { Always, OnHit, None }
     public enum ShieldMode { Ignore, Break, None }
     public enum EntityAge { Baby, Adult, Both }
+    public enum AimPoint { Nearest, Head, Body, Feet }
 
     private final SettingGroup sgGeneral = settings.getDefaultGroup();
     private final SettingGroup sgTargeting = settings.createGroup("Targeting");
@@ -78,15 +80,15 @@ public class KillAuraPlus extends Module {
 
     private final Setting<Boolean> silentAim = sgGeneral.add(new BoolSetting.Builder()
         .name("silent-aim")
-        .description("Серверный аим: поворот отправляется на сервер ровно в момент удара, камера у тебя не двигается. Не работает при rotate = None.")
+        .description("Бить уже после того, как на сервер ушёл поворот к цели (техника Baritone). Камера у тебя не двигается. Не работает при rotate = None.")
         .defaultValue(true)
         .build()
     );
 
-    private final Setting<Target> aimPoint = sgGeneral.add(new EnumSetting.Builder<Target>()
+    private final Setting<AimPoint> aimPoint = sgGeneral.add(new EnumSetting.Builder<AimPoint>()
         .name("aim-point")
-        .description("Куда целиться на цели: голова, тело или ноги.")
-        .defaultValue(Target.Body)
+        .description("Куда целиться: Nearest = ближайшая к камере точка цели, либо голова / тело / ноги.")
+        .defaultValue(AimPoint.Nearest)
         .build()
     );
 
@@ -130,6 +132,13 @@ public class KillAuraPlus extends Module {
     private final Setting<Boolean> pauseOnCombat = sgGeneral.add(new BoolSetting.Builder()
         .name("pause-baritone")
         .description("Freezes Baritone temporarily until you are finished attacking the entity.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Boolean> restoreSlot = sgGeneral.add(new BoolSetting.Builder()
+        .name("restore-slot")
+        .description("Если сервер сам сменил тебе слот хотбара (например, зачарование Confusion), вернуть слот, который выбрал ты. Смена колесиком или цифрой не затрагивается.")
         .defaultValue(true)
         .build()
     );
@@ -297,6 +306,14 @@ public class KillAuraPlus extends Module {
         .build()
     );
 
+    private final Setting<Boolean> noCritsInWater = sgCrits.add(new BoolSetting.Builder()
+        .name("no-crits-in-water")
+        .description("В воде и под водой не ждать крита, а бить обычными ударами.")
+        .defaultValue(true)
+        .visible(onlyCrits::get)
+        .build()
+    );
+
     private final Setting<Integer> fallDelay = sgCrits.add(new IntSetting.Builder()
         .name("fall-delay")
         .description("Сколько тиков ждать после начала падения перед ударом (1 тик = 0.05 с).")
@@ -334,6 +351,9 @@ public class KillAuraPlus extends Module {
 
     private final List<Entity> targets = new ArrayList<>();
     private int previousSlot = -1;
+    private int trackedSlot = -1;
+    private int slotBeforeForce = -1;
+    private volatile boolean forcedSlotChange = false;
     private int hitTimer, switchTimer, debugTicks, fallingTicks;
     private boolean wasPathing = false;
     private boolean swapped = false;
@@ -355,6 +375,8 @@ public class KillAuraPlus extends Module {
     public void onActivate() {
         previousSlot = -1;
         swapped = false;
+        forcedSlotChange = false;
+        trackedSlot = mc.player != null ? mc.player.getInventory().selectedSlot : -1;
     }
 
     @Override
@@ -365,6 +387,8 @@ public class KillAuraPlus extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
+        trackSelectedSlot();
+
         if (!mc.player.isOnGround() && mc.player.getVelocity().y < 0) fallingTicks++;
         else fallingTicks = 0;
 
@@ -403,6 +427,10 @@ public class KillAuraPlus extends Module {
         }
 
         if (targets.isEmpty()) {
+            if (debug.get() && ++debugTicks >= 5) {
+                debugTicks = 0;
+                debugNoTarget();
+            }
             stopAttacking();
             return;
         }
@@ -442,9 +470,6 @@ public class KillAuraPlus extends Module {
         }
 
         attacking = true;
-        if (rotation.get() == RotationMode.Always && !silentAim.get()) {
-            Rotations.rotate(Rotations.getYaw(primary), Rotations.getPitch(primary, aimPoint.get()));
-        }
 
         if (pauseOnCombat.get() && PathManagers.get().isPathing() && !wasPathing) {
             PathManagers.get().pause();
@@ -462,7 +487,41 @@ public class KillAuraPlus extends Module {
             ));
         }
 
-        if (delayCheck() && critReady(primary)) targets.forEach(this::attack);
+        if (delayCheck() && critReady(primary)) {
+            attackAll(primary);
+        } else if (rotation.get() == RotationMode.Always) {
+            // Серверный взгляд на цель каждый тик (экран не двигается)
+            Rotations.rotate(aimYaw(primary), aimPitch(primary));
+        }
+    }
+
+    // Сервер сам сменил слот: запоминаем слот, который выбрал игрок до этого
+    @EventHandler
+    private void onReceivePacket(PacketEvent.Receive event) {
+        if (event.packet instanceof UpdateSelectedSlotS2CPacket) {
+            if (!forcedSlotChange) slotBeforeForce = trackedSlot;
+            forcedSlotChange = true;
+        }
+    }
+
+    // Смена колесиком/цифрой приходит без пакета от сервера, её просто принимаем.
+    // Смену от сервера (forcedSlotChange) откатываем, если включено restore-slot.
+    private void trackSelectedSlot() {
+        int current = mc.player.getInventory().selectedSlot;
+
+        if (forcedSlotChange) {
+            forcedSlotChange = false;
+            if (restoreSlot.get() && slotBeforeForce >= 0 && slotBeforeForce <= 8 && slotBeforeForce != current) {
+                InvUtils.swap(slotBeforeForce, false);
+                current = slotBeforeForce;
+                // Сервер при смене предмета в руке сам сбросил твой кулдаун удара.
+                // Клиент это не заметит (мы вернули слот до его тика), поэтому сбрасываем
+                // кулдаун у себя, чтобы не бить недозаряженным ударом.
+                mc.player.resetLastAttackedTicks();
+            }
+        }
+
+        trackedSlot = current;
     }
 
     @EventHandler
@@ -544,6 +603,63 @@ public class KillAuraPlus extends Module {
         return true;
     }
 
+    private Vec3d aimPos(Entity entity) {
+        Box box = entity.getBoundingBox();
+        Vec3d center = box.getCenter();
+
+        switch (aimPoint.get()) {
+            case Head -> {
+                return new Vec3d(center.x, entity.getEyeY(), center.z);
+            }
+            case Body -> {
+                return center;
+            }
+            case Feet -> {
+                return new Vec3d(center.x, box.minY, center.z);
+            }
+            default -> {
+                // Ближайшая к камере (глазам) точка хитбокса цели
+                Vec3d eye = mc.player.getEyePos();
+                Vec3d nearest = new Vec3d(
+                    MathHelper.clamp(eye.x, box.minX, box.maxX),
+                    MathHelper.clamp(eye.y, box.minY, box.maxY),
+                    MathHelper.clamp(eye.z, box.minZ, box.maxZ)
+                );
+                // Если глаза внутри хитбокса, целимся в центр
+                return nearest.squaredDistanceTo(eye) < 1.0E-6 ? center : nearest;
+            }
+        }
+    }
+
+    private double aimYaw(Entity entity) {
+        return Rotations.getYaw(aimPos(entity));
+    }
+
+    private double aimPitch(Entity entity) {
+        return Rotations.getPitch(aimPos(entity));
+    }
+
+    private void debugNoTarget() {
+        Entity nearest = null;
+        double best = 8;
+        for (Entity entity : mc.world.getEntities()) {
+            if (entity == mc.player || !(entity instanceof LivingEntity living) || !living.isAlive()) continue;
+            if (!entities.get().contains(entity.getType())) continue;
+            double dist = mc.player.distanceTo(entity);
+            if (dist < best) {
+                best = dist;
+                nearest = entity;
+            }
+        }
+        if (nearest == null) return;
+
+        info(String.format(
+            "нет цели: %s дист=%.1f в_радиусе=%s fov=%s вижу=%s",
+            nearest.getType().getUntranslatedName(), best,
+            PlayerUtils.isWithin(nearest, range.get()), inFov(nearest), PlayerUtils.canSeeEntity(nearest)
+        ));
+    }
+
     private boolean inFov(Entity entity) {
         if (fov.get() >= 360) return true;
 
@@ -599,19 +715,26 @@ public class KillAuraPlus extends Module {
 
     private boolean critReady(Entity primary) {
         if (!onlyCrits.get()) return true;
+        if (noCritsInWater.get() && (mc.player.isTouchingWater() || mc.player.isSubmergedInWater())) return true;
         if (canCrit() && fallingTicks >= fallDelay.get()) return true;
         return critFallback.get() && mc.player.distanceTo(primary) <= fallbackDistance.get();
     }
 
-    private void attack(Entity target) {
+    private void attackAll(Entity primary) {
         if (silentAim.get() && rotation.get() != RotationMode.None) {
-            // Поворот уходит на сервер и удар происходит в тот же момент, камера не двигается
-            Rotations.rotate(Rotations.getYaw(target), Rotations.getPitch(target, aimPoint.get()), () -> hit(target));
+            // Как в Baritone: на время тика подменяем угол, пакет движения уходит с нужным
+            // поворотом, и только после него бьём. Камера у тебя при этом не двигается.
+            final List<Entity> snapshot = new ArrayList<>(targets);
+            Rotations.rotate(aimYaw(primary), aimPitch(primary), () -> {
+                for (Entity target : snapshot) hit(target);
+            });
         } else {
-            if (rotation.get() == RotationMode.OnHit) {
-                Rotations.rotate(Rotations.getYaw(target), Rotations.getPitch(target, aimPoint.get()));
+            for (Entity target : targets) {
+                if (rotation.get() == RotationMode.OnHit) {
+                    Rotations.rotate(aimYaw(target), aimPitch(target));
+                }
+                hit(target);
             }
-            hit(target);
         }
     }
 
