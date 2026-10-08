@@ -205,6 +205,15 @@ public class KillAuraPlus extends Module {
         .build()
     );
 
+    private final Setting<Double> hitReach = sgTargeting.add(new DoubleSetting.Builder()
+        .name("hit-reach")
+        .description("Макс. дистанция самого удара (от глаз до ближайшей точки хитбокса цели). У обычного сервера это 3 блока. Всё, что дальше, но в пределах range, модуль только наводит, но не бьёт.")
+        .defaultValue(3.0)
+        .min(1)
+        .sliderMax(6)
+        .build()
+    );
+
     private final Setting<EntityAge> mobAgeFilter = sgTargeting.add(new EnumSetting.Builder<EntityAge>()
         .name("mob-age-filter")
         .description("Determines the age of the mobs to target (baby, adult, or both).")
@@ -479,15 +488,15 @@ public class KillAuraPlus extends Module {
         if (debug.get() && ++debugTicks >= 5) {
             debugTicks = 0;
             info(String.format(
-                "цель=%s дист=%.1f падение=%.2f vy=%.2f земля=%s спринт=%s кд=%.2f крит=%s тиков_падения=%d",
+                "цель=%s дист=%.1f падение=%.2f vy=%.2f земля=%s спринт=%s кд=%.2f крит=%s тиков_падения=%d досяг=%.2f",
                 primary.getType().getUntranslatedName(), (double) mc.player.distanceTo(primary),
                 mc.player.fallDistance, mc.player.getVelocity().y,
                 mc.player.isOnGround(), mc.player.isSprinting(),
-                mc.player.getAttackCooldownProgress(0.5f), canCrit(), fallingTicks
+                mc.player.getAttackCooldownProgress(0.5f), canCrit(), fallingTicks, reachDistance(primary)
             ));
         }
 
-        if (delayCheck() && critReady(primary)) {
+        if (reachDistance(primary) <= hitReach.get() && delayCheck() && critReady(primary)) {
             attackAll(primary);
         } else if (rotation.get() == RotationMode.Always) {
             // Серверный взгляд на цель каждый тик (экран не двигается)
@@ -601,6 +610,18 @@ public class KillAuraPlus extends Module {
         }
 
         return true;
+    }
+
+    // Так же, как считает сервер: от глаз до ближайшей точки хитбокса цели
+    private double reachDistance(Entity entity) {
+        Box box = entity.getBoundingBox();
+        Vec3d eye = mc.player.getEyePos();
+        Vec3d nearest = new Vec3d(
+            MathHelper.clamp(eye.x, box.minX, box.maxX),
+            MathHelper.clamp(eye.y, box.minY, box.maxY),
+            MathHelper.clamp(eye.z, box.minZ, box.maxZ)
+        );
+        return nearest.distanceTo(eye);
     }
 
     private Vec3d aimPos(Entity entity) {
@@ -726,14 +747,16 @@ public class KillAuraPlus extends Module {
             // поворотом, и только после него бьём. Камера у тебя при этом не двигается.
             final List<Entity> snapshot = new ArrayList<>(targets);
             Rotations.rotate(aimYaw(primary), aimPitch(primary), () -> {
-                for (Entity target : snapshot) hit(target);
+                for (Entity target : snapshot) {
+                    if (reachDistance(target) <= hitReach.get()) hit(target);
+                }
             });
         } else {
             for (Entity target : targets) {
                 if (rotation.get() == RotationMode.OnHit) {
                     Rotations.rotate(aimYaw(target), aimPitch(target));
                 }
-                hit(target);
+                if (reachDistance(target) <= hitReach.get()) hit(target);
             }
         }
     }
