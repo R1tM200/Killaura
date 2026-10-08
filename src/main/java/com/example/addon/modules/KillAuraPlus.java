@@ -102,6 +102,16 @@ public class KillAuraPlus extends Module {
         .build()
     );
 
+    private final Setting<Double> aimInset = sgGeneral.add(new DoubleSetting.Builder()
+        .name("aim-inset")
+        .description("Насколько глубже внутрь хитбокса целиться (0 = по самому краю, 0.9 = почти в центр). Больше = надёжнее, когда ты или цель двигаетесь.")
+        .defaultValue(0.5)
+        .min(0)
+        .max(0.9)
+        .sliderMax(0.9)
+        .build()
+    );
+
     private final Setting<Boolean> autoSwitch = sgGeneral.add(new BoolSetting.Builder()
         .name("auto-switch")
         .description("Switches to your selected weapon when attacking the target.")
@@ -764,23 +774,27 @@ public class KillAuraPlus extends Module {
 
         switch (aimPoint.get()) {
             case Head -> {
-                return new Vec3d(center.x, entity.getEyeY(), center.z);
+                return new Vec3d(center.x, Math.min(entity.getEyeY(), box.maxY - 0.15), center.z);
             }
             case Body -> {
                 return center;
             }
             case Feet -> {
-                return new Vec3d(center.x, box.minY, center.z);
+                return new Vec3d(center.x, box.minY + 0.15, center.z);
             }
             default -> {
-                // Ближайшая к камере (глазам) точка хитбокса цели
+                // Ближайшая к камере (глазам) точка, но не на самом краю хитбокса,
+                // а внутри него с запасом (aim-inset), чтобы удар не уходил "в молоко" на ходу
                 Vec3d eye = mc.player.getEyePos();
+                double k = 1.0 - aimInset.get();
+                double hx = (box.maxX - box.minX) / 2.0 * k;
+                double hy = (box.maxY - box.minY) / 2.0 * k;
+                double hz = (box.maxZ - box.minZ) / 2.0 * k;
                 Vec3d nearest = new Vec3d(
-                    MathHelper.clamp(eye.x, box.minX, box.maxX),
-                    MathHelper.clamp(eye.y, box.minY, box.maxY),
-                    MathHelper.clamp(eye.z, box.minZ, box.maxZ)
+                    MathHelper.clamp(eye.x, center.x - hx, center.x + hx),
+                    MathHelper.clamp(eye.y, center.y - hy, center.y + hy),
+                    MathHelper.clamp(eye.z, center.z - hz, center.z + hz)
                 );
-                // Если глаза внутри хитбокса, целимся в центр
                 return nearest.squaredDistanceTo(eye) < 1.0E-6 ? center : nearest;
             }
         }
