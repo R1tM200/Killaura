@@ -389,7 +389,9 @@ public class KillAuraPlus extends Module {
 
     private final List<Entity> targets = new ArrayList<>();
     private boolean spoofPlanned, spoofApplied, hitPending, keysSaved, prevSpoofed;
-    private int planTargetId = -1, prevSpoofTarget = -1;
+    private int planTargetId = -1, prevSpoofTarget = -1, lastTargetId = -1;
+    private float lastSentYaw, lastSentPitch;
+    private Vec3d lastTargetPos;
     private float planYaw, planPitch, realYaw, realPitch;
     private final boolean[] savedKeys = new boolean[4];
     private final List<Entity> hitTargets = new ArrayList<>();
@@ -562,7 +564,16 @@ public class KillAuraPlus extends Module {
                 // Как у обычного клиента: поворот на цель ушёл на сервер в прошлом тике,
                 // а удар идёт в начале этого тика, ДО пакета движения.
                 for (Entity target : targets) {
-                    if (reachDistance(target) <= hitReach.get()) hit(target);
+                    if (reachDistance(target) > hitReach.get()) continue;
+                    if (rayHits(target, lastSentYaw, lastSentPitch)) {
+                        hit(target);
+                        if (debug.get()) {
+                            info(String.format("удар: дист=%.2f спринт=%s vy=%.2f",
+                                reachDistance(target), mc.player.isSprinting(), mc.player.getVelocity().y));
+                        }
+                    } else if (debug.get()) {
+                        info("луч мимо цели, довожу наводку");
+                    }
                 }
                 planSpoof(primary, false);
             } else if (always) {
@@ -587,10 +598,29 @@ public class KillAuraPlus extends Module {
         hitPending = hit;
 
         planTargetId = primary.getId();
-        planYaw = (float) aimYaw(primary);
-        planPitch = (float) aimPitch(primary);
         realYaw = mc.player.getYaw();
         realPitch = mc.player.getPitch();
+
+        // Предсказываем, где будете ты и цель к моменту отправки пакета.
+        // Без этого при ходьбе наводка отстаёт на тик и луч уходит мимо хитбокса.
+        Vec3d tv = Vec3d.ZERO;
+        if (primary.getId() == lastTargetId && lastTargetPos != null) {
+            tv = primary.getPos().subtract(lastTargetPos);
+            if (tv.lengthSquared() > 2.25) tv = Vec3d.ZERO;
+        }
+        lastTargetId = primary.getId();
+        lastTargetPos = primary.getPos();
+
+        Vec3d eyePred = mc.player.getEyePos().add(mc.player.getVelocity());
+        Vec3d to = aimPos(primary, primary.getBoundingBox().offset(tv), eyePred);
+        double dx = to.x - eyePred.x;
+        double dy = to.y - eyePred.y;
+        double dz = to.z - eyePred.z;
+        double yaw = Math.toDegrees(Math.atan2(dz, dx)) - 90.0;
+        double pitch = -Math.toDegrees(Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+
+        planYaw = realYaw + MathHelper.wrapDegrees((float) (yaw - realYaw));
+        planPitch = (float) MathHelper.clamp(pitch, -90.0, 90.0);
 
         hitTargets.clear();
         hitTargets.addAll(targets);
@@ -645,6 +675,10 @@ public class KillAuraPlus extends Module {
             mc.options.rightKey.setPressed(savedKeys[3]);
             keysSaved = false;
         }
+        if (spoofApplied) {
+            lastSentYaw = planYaw;
+            lastSentPitch = planPitch;
+        }
         prevSpoofed = spoofApplied;
         prevSpoofTarget = planTargetId;
         spoofPlanned = false;
@@ -668,7 +702,7 @@ public class KillAuraPlus extends Module {
         if (!spoofApplied || !hitPending) return;
         hitPending = false;
         for (Entity target : hitTargets) {
-            if (target.isAlive() && reachDistance(target) <= hitReach.get()) hit(target);
+            if (target.isAlive() && reachDistance(target) <= hitReach.get() && rayHits(target, planYaw, planPitch)) hit(target);
         }
     }
 
@@ -801,12 +835,17 @@ public class KillAuraPlus extends Module {
     }
 
     private Vec3d aimPos(Entity entity) {
-        Box box = entity.getBoundingBox();
+        return aimPos(entity, entity.getBoundingBox(), mc.player.getEyePos());
+    }
+
+    // box и eye передаются снаружи, чтобы можно было целиться в предсказанные позиции
+    private Vec3d aimPos(Entity entity, Box box, Vec3d eye) {
         Vec3d center = box.getCenter();
 
         switch (aimPoint.get()) {
             case Head -> {
-                return new Vec3d(center.x, Math.min(entity.getEyeY(), box.maxY - 0.15), center.z);
+                double headY = box.minY + (entity.getEyeY() - entity.getBoundingBox().minY);
+                return new Vec3d(center.x, Math.min(headY, box.maxY - 0.15), center.z);
             }
             case Body -> {
                 return center;
@@ -817,7 +856,6 @@ public class KillAuraPlus extends Module {
             default -> {
                 // Ближайшая к камере (глазам) точка, но не на самом краю хитбокса,
                 // а внутри него с запасом (aim-inset), чтобы удар не уходил "в молоко" на ходу
-                Vec3d eye = mc.player.getEyePos();
                 double k = 1.0 - aimInset.get();
                 double hx = (box.maxX - box.minX) / 2.0 * k;
                 double hy = (box.maxY - box.minY) / 2.0 * k;
@@ -830,6 +868,18 @@ public class KillAuraPlus extends Module {
                 return nearest.squaredDistanceTo(eye) < 1.0E-6 ? center : nearest;
             }
         }
+    }
+
+    // Луч из глаз по заданному углу должен попадать в хитбокс цели (как проверяет сервер)
+    private boolean rayHits(Entity target, float yaw, float pitch) {
+        if (reachDistance(target) < 0.01) return true;
+
+        Vec3d eye = mc.player.getEyePos();
+        double yr = Math.toRadians(yaw);
+        double pr = Math.toRadians(pitch);
+        Vec3d dir = new Vec3d(-Math.sin(yr) * Math.cos(pr), -Math.sin(pr), Math.cos(yr) * Math.cos(pr));
+        Vec3d end = eye.add(dir.multiply(hitReach.get() + 1.0));
+        return target.getBoundingBox().raycast(eye, end).isPresent();
     }
 
     private double aimYaw(Entity entity) {
