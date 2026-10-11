@@ -95,6 +95,14 @@ public class KillAuraPlus extends Module {
         .build()
     );
 
+    private final Setting<Boolean> gcdFix = sgGeneral.add(new BoolSetting.Builder()
+        .name("gcd-fix")
+        .description("Подгонять повороты под шаг мыши (GCD) по твоей чувствительности, как у настоящей мыши. Античиты замечают «неживые» углы, когда цель двигается и угол меняется каждый тик.")
+        .defaultValue(true)
+        .visible(silentAim::get)
+        .build()
+    );
+
     private final Setting<AimPoint> aimPoint = sgGeneral.add(new EnumSetting.Builder<AimPoint>()
         .name("aim-point")
         .description("Куда целиться: Nearest = ближайшая к камере точка цели, либо голова / тело / ноги.")
@@ -622,6 +630,16 @@ public class KillAuraPlus extends Module {
         planYaw = realYaw + MathHelper.wrapDegrees((float) (yaw - realYaw));
         planPitch = (float) MathHelper.clamp(pitch, -90.0, 90.0);
 
+        if (gcdFix.get()) {
+            float gcd = mouseGcd();
+            if (gcd > 1.0E-4f) {
+                float baseYaw = prevSpoofed ? lastSentYaw : realYaw;
+                float basePitch = prevSpoofed ? lastSentPitch : realPitch;
+                planYaw = baseYaw + Math.round((planYaw - baseYaw) / gcd) * gcd;
+                planPitch = MathHelper.clamp(basePitch + Math.round((planPitch - basePitch) / gcd) * gcd, -90.0f, 90.0f);
+            }
+        }
+
         hitTargets.clear();
         hitTargets.addAll(targets);
 
@@ -630,6 +648,12 @@ public class KillAuraPlus extends Module {
 
     // Переписываем нажатые клавиши ходьбы так, чтобы при серверном угле игрок шёл
     // примерно туда же, куда он идёт по своей камере (с точностью до 45 градусов).
+    // Минимальный шаг поворота настоящей мыши при твоей чувствительности (в градусах)
+    private float mouseGcd() {
+        double f = mc.options.getMouseSensitivity().getValue() * 0.6 + 0.2;
+        return (float) (f * f * f * 8.0 * 0.15);
+    }
+
     private void applyMoveFix() {
         boolean fw = mc.options.forwardKey.isPressed();
         boolean bk = mc.options.backKey.isPressed();
